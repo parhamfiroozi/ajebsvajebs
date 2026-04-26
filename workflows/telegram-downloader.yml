@@ -1,4 +1,4 @@
-name: Download from Commit & Save to Repo
+name: Telegram Commit Downloader
 
 on:
   push:
@@ -6,16 +6,16 @@ on:
       - "**"
 
 jobs:
-  save-file:
+  download-from-commit:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
-    # Prevent infinite loops caused by commits from this workflow
+    # Prevent infinite loops (our own commits include [skip ci])
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -25,13 +25,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y aria2 zip
 
-      - name: Extract URLs and download files
+      - name: Parse commit message for URLs
+        id: parse
         run: |
           MSG=$(git log -1 --pretty=%B)
           echo "Commit message:"
+          echo "----------------"
           echo "$MSG"
+          echo "----------------"
 
-          # Detect mode
+          # MODE detection
           if echo "$MSG" | grep -qP 'download-zip:'; then
             MODE="zip"
             URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
@@ -39,42 +42,64 @@ jobs:
             MODE="normal"
             URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
           else
-            echo "❌ No download: or download-zip: command found."
-            exit 1
+            echo "❌ No download: or download-zip: in commit message. Exiting."
+            exit 0  # no-op, just skip
           fi
 
           echo "Mode: $MODE"
-          echo "URLs: $URL_LINE"
+          echo "URLs line: $URL_LINE"
 
-          mkdir -p downloads tmp_downloads
+          # Export to env & files for next steps
+          echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "$URL_LINE" > urls.txt
 
-          # Download all URLs into tmp_downloads
-          for URL in $URL_LINE; do
-            FILENAME=$(basename "$URL")
-            echo "⬇️ Downloading $URL → $FILENAME"
+      - name: Download files with aria2
+        run: |
+          mkdir -p tmp_downloads downloads
+          echo "Will download these URLs:"
+          cat urls.txt || true
 
-            aria2c \
-              --split=2 \
-              --max-connection-per-server=2 \
-              --min-split-size=90M \
-              --dir="tmp_downloads" \
-              "$URL"
-          done
+          # download each URL in urls.txt
+          while read -r URL; do
+            [ -z "$URL" ] && continue
+            for U in $URL; do
+              echo "⬇️ Downloading: $U"
+              aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=90M \
+                --dir="tmp_downloads" \
+                "$U"
+            done
+          done < urls.txt
 
-          # If mode=zip → combine all into 1 archive
-          if [ "$MODE" = "zip" ]; then
-            ARCHIVE="tmp_downloads/combined_$(date +%Y%m%d_%H%M%S).zip"
-            echo "📦 Creating combined zip: $ARCHIVE"
-            zip -j "$ARCHIVE" tmp_downloads/*
-            rm tmp_downloads/* 2>/dev/null
-            mv "$ARCHIVE" tmp_downloads/
-          fi
+          ls -lh tmp_downloads || true
 
-      - name: Split >90MB files & copy normal files
+      - name: Combine files into one zip (download-zip mode)
+        if: env.MODE == 'zip'
         run: |
           mkdir -p downloads
 
-          LIMIT=$((90 * 1024 * 1024))  # 90MB
+          TS=$(date +%Y%m%d_%H%M%S)
+          COMBINED="tmp_downloads/combined_${TS}.zip"
+
+          echo "📦 Zipping all downloaded files into: $COMBINED"
+
+          cd tmp_downloads
+          zip -j "$COMBINED" * || echo "Nothing to zip?"
+          cd ..
+
+          # Clean old originals, keep only combined zip inside tmp_downloads
+          find tmp_downloads -type f ! -name "combined_*.zip" -delete
+
+          echo "Contents of tmp_downloads now:"
+          ls -lh tmp_downloads || true
+
+      - name: Apply 90MB rule (split or keep)
+        run: |
+          mkdir -p downloads
+
+          LIMIT=$((90 * 1024 * 1024))
 
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
@@ -82,33 +107,42 @@ jobs:
             BASENAME=$(basename "$FILE")
             SIZE=$(stat -c%s "$FILE")
 
+            echo "Processing $BASENAME (size: $((SIZE/1024/1024)) MB)"
+
             if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ $BASENAME is $((SIZE/1024/1024))MB — splitting into 90MB zip parts..."
+              echo "✂️ $BASENAME is >90MB — splitting into multi-part zip..."
 
               cd tmp_downloads
-              # Creates: BASENAME.zip, BASENAME.z01, BASENAME.z02, ...
+              # Result: BASENAME.zip, BASENAME.z01, BASENAME.z02, ...
               zip -s 90m "../downloads/${BASENAME}.zip" "$BASENAME"
               cd ..
 
               echo "Created parts:"
-              ls downloads/${BASENAME}.zip*
+              ls -lh downloads/${BASENAME}.zip*
             else
-              echo "✅ $BASENAME is under 90MB — keeping original file"
+              echo "✅ $BASENAME is ≤90MB — keeping original file"
               cp "$FILE" downloads/
             fi
           done
 
+          echo "Final downloads/ directory:"
+          ls -lh downloads || true
+
           rm -rf tmp_downloads
 
-      - name: Commit & Push
+      - name: Commit & push downloaded files
         run: |
-          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git add downloads/ || true
 
-          git add downloads/
-          git commit -m "Add downloaded files [skip ci]" || echo "Nothing new to commit"
+          # If nothing to commit, exit cleanly
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
 
-          echo "🚀 Pushing to branch: $BRANCH"
-          git push origin HEAD:$BRANCH
+          git commit -m "Add downloaded files [skip ci]"
+          echo "🚀 Pushing back to ${GITHUB_REF_NAME}"
+          git push origin HEAD:${GITHUB_REF_NAME}
