@@ -1,39 +1,114 @@
-name: Telegram Downloader
+name: Download from Commit & Save to Repo
 
 on:
-  repository_dispatch:
-    types: [download_request]
+  push:
+    branches:
+      - "**"
 
 jobs:
-  download:
+  save-file:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
+    # Prevent infinite loops caused by commits from this workflow
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install aria2
-        run: sudo apt-get install -y aria2
+      - name: Install aria2 & zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip
 
-      - name: Download file
+      - name: Extract URLs and download files
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message:"
+          echo "$MSG"
+
+          # Detect mode
+          if echo "$MSG" | grep -qP 'download-zip:'; then
+            MODE="zip"
+            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+          elif echo "$MSG" | grep -qP 'download:'; then
+            MODE="normal"
+            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+          else
+            echo "❌ No download: or download-zip: command found."
+            exit 1
+          fi
+
+          echo "Mode: $MODE"
+          echo "URLs: $URL_LINE"
+
+          mkdir -p downloads tmp_downloads
+
+          # Download all URLs into tmp_downloads
+          for URL in $URL_LINE; do
+            FILENAME=$(basename "$URL")
+            echo "⬇️ Downloading $URL → $FILENAME"
+
+            aria2c \
+              --split=2 \
+              --max-connection-per-server=2 \
+              --min-split-size=90M \
+              --dir="tmp_downloads" \
+              "$URL"
+          done
+
+          # If mode=zip → combine all into 1 archive
+          if [ "$MODE" = "zip" ]; then
+            ARCHIVE="tmp_downloads/combined_$(date +%Y%m%d_%H%M%S).zip"
+            echo "📦 Creating combined zip: $ARCHIVE"
+            zip -j "$ARCHIVE" tmp_downloads/*
+            rm tmp_downloads/* 2>/dev/null
+            mv "$ARCHIVE" tmp_downloads/
+          fi
+
+      - name: Split >90MB files & copy normal files
         run: |
           mkdir -p downloads
-          URL="${{ github.event.client_payload.url }}"
-          FILE=$(basename "$URL")
-          aria2c "$URL" -d downloads -o "$FILE"
-          echo "FILE_NAME=$FILE" >> $GITHUB_ENV
+
+          LIMIT=$((90 * 1024 * 1024))  # 90MB
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+
+            BASENAME=$(basename "$FILE")
+            SIZE=$(stat -c%s "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ $BASENAME is $((SIZE/1024/1024))MB — splitting into 90MB zip parts..."
+
+              cd tmp_downloads
+              # Creates: BASENAME.zip, BASENAME.z01, BASENAME.z02, ...
+              zip -s 90m "../downloads/${BASENAME}.zip" "$BASENAME"
+              cd ..
+
+              echo "Created parts:"
+              ls downloads/${BASENAME}.zip*
+            else
+              echo "✅ $BASENAME is under 90MB — keeping original file"
+              cp "$FILE" downloads/
+            fi
+          done
+
+          rm -rf tmp_downloads
 
       - name: Commit & Push
         run: |
+          BRANCH="${GITHUB_REF_NAME}"
+
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add downloads/
-          git commit -m "Downloaded file ${{ env.FILE_NAME }}"
-          git push
 
-      - name: Send link back to Telegram
-        run: |
-          RAW="https://raw.githubusercontent.com/${{ github.repository }}/main/downloads/${{ env.FILE_NAME }}"
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage \
-            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-            -d text="✅ Your file is ready:\n$RAW"
+          git add downloads/
+          git commit -m "Add downloaded files [skip ci]" || echo "Nothing new to commit"
+
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin HEAD:$BRANCH
